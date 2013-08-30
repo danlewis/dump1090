@@ -41,6 +41,8 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <libpq-fe.h>
+#include <libpqtypes.h>
 #include "rtl-sdr.h"
 #include "anet.h"
 
@@ -77,7 +79,7 @@
  * at least greater than a given level for us to dump the signal. */
 #define MODES_DEBUG_NOPREAMBLE_LEVEL 25
 
-#define MODES_INTERACTIVE_REFRESH_TIME 250      /* Milliseconds */
+#define MODES_INTERACTIVE_REFRESH_TIME 2000      /* Milliseconds */
 #define MODES_INTERACTIVE_ROWS 15               /* Rows on screen */
 #define MODES_INTERACTIVE_TTL 60                /* TTL before being removed */
 
@@ -115,6 +117,11 @@ struct aircraft {
     int odd_cprlon;
     int even_cprlat;
     int even_cprlon;
+    int alert;
+    int ground;
+    int emergency;
+    int spi;
+    int postgres_id;
     double lat, lon;    /* Coordinated obtained from CPR encoded data. */
     long long odd_cprtime, even_cprtime;
     struct aircraft *next; /* Next aircraft in our linked list. */
@@ -170,7 +177,11 @@ struct {
     int onlyaddr;                   /* Print only ICAO addresses. */
     int metric;                     /* Use metric units. */
     int aggressive;                 /* Aggressive detection algorithm. */
-
+    
+    /* Postgres */
+    int postgres;                  /* postgres */
+    PGconn *pgconn;                  /* databas connetion */
+    
     /* Interactive mode */
     struct aircraft *aircrafts;
     long long interactive_last_update;  /* Last screen update in milliseconds */
@@ -232,7 +243,7 @@ struct modesMessage {
     /* Fields used by multiple message types. */
     int altitude, unit;
 };
-
+void postgresUpdateData(struct aircraft *a);
 void interactiveShowData(void);
 struct aircraft* interactiveReceiveData(struct modesMessage *mm);
 void modesSendRawOutput(struct modesMessage *mm);
@@ -262,6 +273,7 @@ void modesInitConfig(void) {
     Modes.enable_agc = 0;
     Modes.freq = MODES_DEFAULT_FREQ;
     Modes.filename = NULL;
+    Modes.pgconn = NULL;
     Modes.fix_errors = 1;
     Modes.check_crc = 1;
     Modes.raw = 0;
@@ -277,6 +289,7 @@ void modesInitConfig(void) {
     Modes.interactive_rows = MODES_INTERACTIVE_ROWS;
     Modes.interactive_ttl = MODES_INTERACTIVE_TTL;
     Modes.aggressive = 0;
+    Modes.postgres = 0;
 }
 
 void modesInit(void) {
@@ -297,6 +310,7 @@ void modesInit(void) {
     memset(Modes.icao_cache,0,sizeof(uint32_t)*MODES_ICAO_CACHE_LEN*2);
     Modes.aircrafts = NULL;
     Modes.interactive_last_update = 0;
+
     if ((Modes.data = malloc(Modes.data_len)) == NULL ||
         (Modes.magnitude = malloc(Modes.data_len*2)) == NULL) {
         fprintf(stderr, "Out of memory allocating data buffer.\n");
@@ -315,6 +329,14 @@ void modesInit(void) {
     for (i = 0; i <= 128; i++) {
         for (q = 0; q <= 128; q++) {
             Modes.maglut[i*129+q] = round(sqrt(i*i+q*q)*360);
+        }
+    }
+    if( Modes.postgres ){
+       Modes.pgconn = PQconnectdb("dbname = flighttracker_dev");
+        if( PQstatus(Modes.pgconn) != CONNECTION_OK ){
+          fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(Modes.pgconn));
+        }else{
+          PQinitTypes(Modes.pgconn);
         }
     }
 
@@ -1562,6 +1584,63 @@ void useModesMessage(struct modesMessage *mm) {
     }
 }
 
+/* ========================= Postgres mode =============================== */
+void postgresUpdateData(struct aircraft *a){
+  /* time_t now = time(NULL);*/
+  /* time_t created_at = ctime(NULL);*/
+  PGresult *res;
+  
+     
+  if( a->postgres_id == 0){
+    /* find plane */
+    res = PQexecf(Modes.pgconn, "SELECT id FROM aircrafts WHERE hex = %text ORDER BY aircrafts.id ASC LIMIT 1;", a->hexaddr);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK){
+      fprintf(stderr, "Error finding aircraft %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
+    }else{
+      if(PQntuples(res) ==1){
+        PQgetf(res, 0, "%int4", 0, &a->postgres_id);
+      }
+    }
+    PQclear(res);
+    if( a->postgres_id == 0 ){
+      /* create new plane */
+      res = PQexecf(Modes.pgconn,
+         "INSERT INTO aircrafts (callsign, hex) VALUES (%text, %text) RETURNING id;", a->flight, a->hexaddr);
+      if (PQresultStatus(res) != PGRES_TUPLES_OK){
+        fprintf(stderr, "Error adding aircraft %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
+      }else{
+        PQgetf(res, 0, "%int4", 0, &a->postgres_id);
+      }
+      PQclear(res);
+    }
+  }
+  /* SOMEHOW ADD callsign once we know it */
+  /* Add Message to aircraft */
+  int altitude = a->altitude, speed = a->speed;
+  /* Convert units to metric. */
+  altitude /= 3.2828;
+  speed *= 1.852;
+  
+  res = PQexecf(Modes.pgconn, "INSERT INTO messages (aircraft_id, altitude, emergency, ground_speed, latitude, longitude, on_ground, squawk, squawk_alert, spi, track, vertical_rate) VALUES (%int, %int, %int, %int, %double, %double, %int, %int, %int, %int, %int, %int);",
+    a->postgres_id, altitude, a->emergency, speed, a->lat, a->lon, a->ground, 0,0, a->spi, a->track, 0);
+  if (PQresultStatus(res) != PGRES_COMMAND_OK){
+    fprintf(stderr, "Error adding message to %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
+  }
+  PQclear(res);
+  /* Add Message */
+    /* 
+    * res = PQexec(Modes.pgconn, 'INSERT INTO messages ()');
+    * if (PQresultStatus(res) != PGRES_COMMAND_OK){
+    *   fprintf(stderr, "Database write failed: %s", PQerrorMessage(Modes.pgconn));
+    * }
+    * PQclear(res); */
+  /*PQfinish(conn);*/
+  
+
+  /* printf("POSTGRES %-6s\n",
+  *     a->hexaddr
+  *     );*/
+}
 /* ========================= Interactive mode =============================== */
 
 /* Return a new aircraft structure for the interactive mode linked list
@@ -1585,6 +1664,11 @@ struct aircraft *interactiveCreateAircraft(uint32_t addr) {
     a->lon = 0;
     a->seen = time(NULL);
     a->messages = 0;
+    a->alert = 0;
+    a->emergency = 0;
+    a->spi = 0;
+    a->ground = 0;
+    a->postgres_id = 0;
     a->next = NULL;
     return a;
 }
@@ -1765,7 +1849,17 @@ struct aircraft *interactiveReceiveData(struct modesMessage *mm) {
 
     a->seen = time(NULL);
     a->messages++;
-
+    
+    if (mm->msgtype == 4 || mm->msgtype == 5 || mm->msgtype == 21) {
+        /* Node: identity is calculated/kept in base10 but is actually
+         * octal (07500 is represented as 7500) */
+        if (mm->identity == 7500 || mm->identity == 7600 ||
+            mm->identity == 7700) a->emergency = -1;
+        if (mm->fs == 1 || mm->fs == 3) a->ground = -1;
+        if (mm->fs == 2 || mm->fs == 3 || mm->fs == 4) a->alert = -1;
+        if (mm->fs == 4 || mm->fs == 5) a->spi = -1;
+    }
+    
     if (mm->msgtype == 0 || mm->msgtype == 4 || mm->msgtype == 20) {
         a->altitude = mm->altitude;
     } else if (mm->msgtype == 17) {
@@ -1827,6 +1921,9 @@ void interactiveShowData(void) {
             a->hexaddr, a->flight, altitude, speed,
             a->lat, a->lon, a->track, a->messages,
             (int)(now - a->seen));
+        if ( Modes.postgres ){
+          postgresUpdateData(a);
+        }
         a = a->next;
         count++;
     }
@@ -2128,7 +2225,7 @@ char *aircraftsToJson(int *len) {
     int buflen = 1024; /* The initial buffer is incremented as needed. */
     char *buf = malloc(buflen), *p = buf;
     int l;
-
+    time_t now = time(NULL);
     l = snprintf(p,buflen,"[\n");
     p += l; buflen -= l;
     while(a) {
@@ -2144,9 +2241,10 @@ char *aircraftsToJson(int *len) {
             l = snprintf(p,buflen,
                 "{\"hex\":\"%s\", \"flight\":\"%s\", \"lat\":%f, "
                 "\"lon\":%f, \"altitude\":%d, \"track\":%d, "
-                "\"speed\":%d},\n",
+                "\"speed\":%d, \"seen\":%d, \"ground\":%d, "
+                "\"alert\":%d, \"emergency\":%d, \"spi\":%d},\n",
                 a->hexaddr, a->flight, a->lat, a->lon, a->altitude, a->track,
-                a->speed);
+                a->speed, (int)(now - a->seen), a->ground, a->alert, a->emergency, a->spi);
             p += l; buflen -= l;
             /* Resize if needed. */
             if (buflen < 256) {
@@ -2379,6 +2477,7 @@ void showHelp(void) {
 "--onlyaddr               Show only ICAO addresses (testing purposes).\n"
 "--metric                 Use metric units (meters, km/h, ...).\n"
 "--snip <level>           Strip IQ file removing samples < level.\n"
+"--postgres               Post data to postgres database\n"
 "--debug <flags>          Debug mode (verbose), see README for details.\n"
 "--help                   Show this help.\n"
 "\n"
@@ -2411,6 +2510,7 @@ void backgroundTasks(void) {
         interactiveShowData();
         Modes.interactive_last_update = mstime();
     }
+
 }
 
 int main(int argc, char **argv) {
@@ -2490,6 +2590,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[j],"--help")) {
             showHelp();
             exit(0);
+        } else if (!strcmp(argv[j],"--postgres")) {
+          Modes.postgres = 1;
         } else {
             fprintf(stderr,
                 "Unknown or not enough arguments for option '%s'.\n\n",
