@@ -121,7 +121,10 @@ struct aircraft {
     int ground;
     int emergency;
     int spi;
+    int vertical_rate;
     int postgres_id;
+    int callsign_added;
+    int squawk;
     double lat, lon;    /* Coordinated obtained from CPR encoded data. */
     long long odd_cprtime, even_cprtime;
     struct aircraft *next; /* Next aircraft in our linked list. */
@@ -1586,11 +1589,8 @@ void useModesMessage(struct modesMessage *mm) {
 
 /* ========================= Postgres mode =============================== */
 void postgresUpdateData(struct aircraft *a){
-  /* time_t now = time(NULL);*/
-  /* time_t created_at = ctime(NULL);*/
   PGresult *res;
   
-     
   if( a->postgres_id == 0){
     /* find plane */
     res = PQexecf(Modes.pgconn, "SELECT id FROM aircrafts WHERE hex = %text ORDER BY aircrafts.id ASC LIMIT 1;", a->hexaddr);
@@ -1605,7 +1605,7 @@ void postgresUpdateData(struct aircraft *a){
     if( a->postgres_id == 0 ){
       /* create new plane */
       res = PQexecf(Modes.pgconn,
-         "INSERT INTO aircrafts (callsign, hex) VALUES (%text, %text) RETURNING id;", a->flight, a->hexaddr);
+         "INSERT INTO aircrafts (callsign, created_at, hex, updated_at) VALUES (trim(%text), current_timestamp AT TIME ZONE 'UTC', %text, current_timestamp AT TIME ZONE 'UTC') RETURNING id;", a->flight, a->hexaddr);
       if (PQresultStatus(res) != PGRES_TUPLES_OK){
         fprintf(stderr, "Error adding aircraft %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
       }else{
@@ -1613,33 +1613,36 @@ void postgresUpdateData(struct aircraft *a){
       }
       PQclear(res);
     }
+    if( a->flight[0] != '\0' ){
+      a->callsign_added = 1;
+    }
   }
   /* SOMEHOW ADD callsign once we know it */
-  /* Add Message to aircraft */
-  int altitude = a->altitude, speed = a->speed;
-  /* Convert units to metric. */
-  altitude /= 3.2828;
-  speed *= 1.852;
-  
-  res = PQexecf(Modes.pgconn, "INSERT INTO messages (aircraft_id, altitude, emergency, ground_speed, latitude, longitude, on_ground, squawk, squawk_alert, spi, track, vertical_rate) VALUES (%int, %int, %int, %int, %double, %double, %int, %int, %int, %int, %int, %int);",
-    a->postgres_id, altitude, a->emergency, speed, a->lat, a->lon, a->ground, 0,0, a->spi, a->track, 0);
-  if (PQresultStatus(res) != PGRES_COMMAND_OK){
-    fprintf(stderr, "Error adding message to %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
+  if ( a->callsign_added == 0 && a->flight[0] != '\0' ){
+    /*add callsign to plane */
+    res = PQexecf(Modes.pgconn,
+       "UPDATE aircrafts SET (callsign, updated_at) = (trim(%text), current_timestamp AT TIME ZONE 'UTC') WHERE id = %int4;", a->flight, a->postgres_id);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK){
+      fprintf(stderr, "Error updating aircraft callsign %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
+    }else{
+      a->callsign_added = 1;
+    }
+    PQclear(res);
   }
-  PQclear(res);
-  /* Add Message */
-    /* 
-    * res = PQexec(Modes.pgconn, 'INSERT INTO messages ()');
-    * if (PQresultStatus(res) != PGRES_COMMAND_OK){
-    *   fprintf(stderr, "Database write failed: %s", PQerrorMessage(Modes.pgconn));
-    * }
-    * PQclear(res); */
-  /*PQfinish(conn);*/
+  /* Add Message to aircraft if message is less than 3 seconds*/
+  if( (time(NULL) - a->seen) <= 3){
+    int altitude = a->altitude, speed = a->speed;
+    /* Convert units to metric. */
+    altitude /= 3.2828;
+    speed *= 1.852;
   
-
-  /* printf("POSTGRES %-6s\n",
-  *     a->hexaddr
-  *     );*/
+    res = PQexecf(Modes.pgconn, "INSERT INTO messages (aircraft_id, altitude, created_at, emergency, ground_speed, latitude, longitude, on_ground, squawk, squawk_alert, spi, track, updated_at, vertical_rate) VALUES (%int4, %int4, current_timestamp AT TIME ZONE 'UTC', %int4, %int4, %float8, %float8, %int4, %int4, %int4, %int4, %int4, current_timestamp AT TIME ZONE 'UTC', %int4);",
+      a->postgres_id, altitude, a->emergency, speed, a->lat, a->lon, a->ground, a->squawk, a->alert, a->spi, a->track, a->vertical_rate);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK){
+      fprintf(stderr, "Error adding message to %s: %s\n", a->hexaddr, PQresStatus(PQresultStatus(res)) );
+    }
+    PQclear(res);
+  }
 }
 /* ========================= Interactive mode =============================== */
 
@@ -1669,6 +1672,9 @@ struct aircraft *interactiveCreateAircraft(uint32_t addr) {
     a->spi = 0;
     a->ground = 0;
     a->postgres_id = 0;
+    a->callsign_added = 0;
+    a->vertical_rate = 0;
+    a->squawk = 0;
     a->next = NULL;
     return a;
 }
@@ -1849,10 +1855,10 @@ struct aircraft *interactiveReceiveData(struct modesMessage *mm) {
 
     a->seen = time(NULL);
     a->messages++;
-    
     if (mm->msgtype == 4 || mm->msgtype == 5 || mm->msgtype == 21) {
         /* Node: identity is calculated/kept in base10 but is actually
          * octal (07500 is represented as 7500) */
+        a->squawk = mm->identity;
         if (mm->identity == 7500 || mm->identity == 7600 ||
             mm->identity == 7700) a->emergency = -1;
         if (mm->fs == 1 || mm->fs == 3) a->ground = -1;
@@ -1885,6 +1891,11 @@ struct aircraft *interactiveReceiveData(struct modesMessage *mm) {
             if (mm->mesub == 1 || mm->mesub == 2) {
                 a->speed = mm->velocity;
                 a->track = mm->heading;
+                if (mm->vert_rate_sign == 1){
+                  a->vertical_rate = mm->vert_rate*-1;
+                }else{
+                  a->vertical_rate = mm->vert_rate;
+                }
             }
         }
     }
